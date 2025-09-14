@@ -109,7 +109,7 @@ de reconciliar los cambios en un único archivo (un archivo úncio mezclado).
 Mientras los cambios estén en contextos distintos, Git encontrará la forma de
 mezclarlos.
 
-Veamos como se ve esto. Supongamos que perimero hacemos una rama `conflictos`
+Veamos como se ve esto. Supongamos que primero hacemos una rama `conflictos`
 en nuetro "primer-repo". Luego editamos nuestro archivo de texto. Cambiamos a
 la rama `master` y volvemos a editar el mismo archivo en el mismo lugar.
 

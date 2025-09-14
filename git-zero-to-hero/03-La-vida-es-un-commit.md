@@ -82,7 +82,7 @@ $
 ```
 
 Nos muestra el cambio más reciente arriba de todo, seguido por los anteriores.
-Por ahjora tenemos sólo dos cambios. Pero fíjense que muestra todo lo que
+Por ahora tenemos sólo dos cambios. Pero fíjense que muestra todo lo que
 fuimos escribiendo en nuestros mensajes de commit.
 
 Git llama a un commit por un valor único codificado en sha256. Ese valor
