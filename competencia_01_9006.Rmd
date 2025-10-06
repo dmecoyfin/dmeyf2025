@@ -1,0 +1,2410 @@
+---
+title: 'Análisis'
+output: html_document
+---
+
+9006
+
+menos hiperparámetros
+HT dataset: fe2 lags deltas 1
+train 1,2,3
+
+final train 1, 2, 3
+dataset final deltas y lags 1
+6 semillas
+
+future 06
+false future 04
+
+resumen ADAPTAR
+HT 9002: auc 0.9441; fe lags deltas 1,2,3; 1,2,3; 0.2 - final: 1,2,3; fe lags deltas 1; 6 seeds
+
+
+### librerías
+```{r chunk4}
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+
+if( !require("lightgbm") ) install.packages("lightgbm")
+require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+```
+
+## Generacion de la clase_ternaria
+Esta parte se debe correr con el runtime en lenguaje **R** Ir al menu, Runtime -> Change Runtime Tipe -> Runtime type -> R
+```{r chunk1}
+require( "data.table" )
+
+# leo el dataset
+
+# dataset <- fread("/content/datasets/competencia_01_crudo.csv" )
+
+#Rstudio
+dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/competencia_01_crudo.csv" )
+
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+
+# calculo orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+# VM
+# fwrite( dataset,
+# fwrite( dataset,
+#     file =  "/content/datasets/competencia_01.csv.gz",
+#     sep = ","
+# )
+
+#guardo clase ternaria en segundo lugar persistente
+# fwrite(dataset,
+# fwrite(dataset,
+#        file = "/content/buckets/b1/datasets/competencia_01.csv.gz",
+#        sep = ",")
+
+
+#Rstudio
+
+```
+
+```{r chunk2}
+dim(dataset)
+```
+
+```{r chunk3}
+setorder( dataset, foto_mes, clase_ternaria, numero_de_cliente)
+dataset[, .N, list(foto_mes, clase_ternaria)]
+```
+
+# DATA ENGINEERING
+
+
+### cargo dataset
+```{r chunk5}
+
+# dataset <- fread("/content/datasets/competencia_01.csv.gz", stringsAsFactors= TRUE) #este tiene clase ternaria y lee factores
+
+dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/competencia_01.csv.gz", stringsAsFactors= TRUE) #este tiene clase ternaria y lee factores
+
+# dataset <- fread("/content/datasets/competencia_01.csv.gz") #este tiene clase ternaria
+
+
+```
+
+## FUNCION LAGS Y DELTAS
+```{r chunk6}
+
+generar_lags_y_deltas <- function(dt, variables, max_lags = NULL) {
+  # Calcular max_lags si no se especifica (MÁXIMO POSIBLE)
+  if(is.null(max_lags)) {
+    periodos_totales <- length(unique(dt$foto_mes))
+    max_periodos_cliente <- dt[, .N, by = numero_de_cliente][, max(N)]
+    #max_lags <- min(periodos_totales - 1, max_periodos_cliente - 1)  # TODOS LOS LAGS
+    max_lags <- 1  # SOLAMENTE ORDEN 1
+    cat("Max_lags calculado:", max_lags, "\n")
+  }
+  # Hacer copia y ordenar
+  dt_work <- copy(dt)
+  setkeyv(dt_work, c("numero_de_cliente", "foto_mes"))
+  cat("Generando lags para", length(variables), "variables hasta lag", max_lags, "\n")
+  # GENERAR LAGS
+  for(var in variables) {
+    cat("Procesando:", var, "\n")
+    # Crear todos los lags para esta variable
+    for(lag in 1:max_lags) {
+      nombre_lag <- paste0(var, "_lag", lag)
+      dt_work[, (nombre_lag) := shift(.SD, lag), by = numero_de_cliente, .SDcols = var]
+    }
+    # Crear todos los delta_lags para esta variable
+    for(lag in 1:max_lags) {
+      nombre_lag <- paste0(var, "_lag", lag)
+      nombre_delta <- paste0(var, "_delta", lag)
+      dt_work[, (nombre_delta) := get(var) - get(nombre_lag)]
+    }
+  }
+  cat("✅ Completado!\n")
+  cat("Dimensiones finales:", dim(dt_work), "\n")
+  return(dt_work)
+}
+
+```
+
+## tipos datos
+```{r chunk7}
+#TIPOS DE DATOS POR COLUMNA
+cat("=== TIPOS DE DATOS POR COLUMNA ===\n")
+tipos_datos <- sapply(dataset, class)
+print(tipos_datos)
+
+```
+
+```{r chunk8}
+resumen_tipos <- data.table(
+  columna = names(dataset),
+  tipo = sapply(dataset, function(x) class(x)[1]),
+  tipo_r = sapply(dataset, typeof),
+  valores_unicos = sapply(dataset, function(x) length(unique(x))),
+  valores_na = sapply(dataset, function(x) sum(is.na(x))),
+  porcentaje_na = sapply(dataset, function(x) round(sum(is.na(x))/length(x)*100, 2))
+)
+
+print(resumen_tipos)
+```
+
+## v excluir
+```{r chunk9}
+# variables_excluir
+variables_excluir <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+```
+
+## v continuas
+```{r chunk10}
+# variables continuas
+
+variables_continuas <- c(
+  # Variables de rentabilidad y comisiones
+  "mrentabilidad", "mrentabilidad_annual", "mcomisiones",
+  "mactivos_margen", "mpasivos_margen",
+
+  # Cuentas y saldos principales
+  "mcuenta_corriente", "mcaja_ahorro", "mcuentas_saldo",
+
+  # Tarjetas - consumos
+  "mtarjeta_visa_consumo", "mtarjeta_master_consumo",
+
+  # Préstamos - montos
+  "mprestamos_personales", "mprestamos_prendarios", "mprestamos_hipotecarios",
+
+  # Inversiones - montos
+  "mplazo_fijo_pesos", "mplazo_fijo_dolares",
+  "minversion1_pesos", "minversion1_dolares", "minversion2",
+
+  # Payroll
+  "mpayroll", "mpayroll2",
+
+  # Débitos automáticos
+  "mcuenta_debitos_automaticos",
+
+  # Servicios y pagos
+  "mpagodeservicios", "mpagomiscuentas",
+
+  # Comisiones
+  "mcomisiones_mantenimiento", "mcomisiones_otras",
+
+  # Forex
+  "mforex_buy", "mforex_sell",
+
+  # Transferencias
+  "mtransferencias_recibidas", "mtransferencias_emitidas",
+
+  # Extracciones y ATM
+  "mextraccion_autoservicio", "matm", "matm_other",
+
+  # Cheques
+  "mcheques_depositados", "mcheques_emitidos",
+
+  # Tarjetas Master y Visa - saldos y pagos
+  "Master_msaldototal", "Master_msaldopesos", "Master_msaldodolares",
+  "Master_mconsumospesos", "Master_mconsumosdolares",
+  "Master_mlimitecompra", "Master_madelantopesos", "Master_madelantodolares",
+  "Master_mpagado", "Master_mpagospesos", "Master_mpagosdolares",
+  "Master_mconsumototal", "Master_mpagominimo",
+
+  "Visa_msaldototal", "Visa_msaldopesos", "Visa_msaldodolares",
+  "Visa_mconsumospesos", "Visa_mconsumosdolares",
+  "Visa_mlimitecompra", "Visa_madelantopesos", "Visa_madelantodolares",
+  "Visa_mpagado", "Visa_mpagospesos", "Visa_mpagosdolares",
+  "Visa_mconsumototal", "Visa_mpagominimo",
+
+  "mcuenta_corriente_adicional", "Master_mfinanciacion_limite", "Visa_mfinanciacion_limite",
+"mcheques_emitidos_rechazados", "mcheques_depositados_rechazados", "mtarjeta_master_descuentos",
+"mcaja_ahorro_adicional", "mtarjeta_visa_descuentos", "mttarjeta_master_debitos_automaticos",
+"mcaja_ahorro_dolares", "mttarjeta_visa_debitos_automaticos", "mautoservicio", "mcajeros_propios_descuentos"
+ )
+
+cat("Variables continuas:", length(variables_continuas), "\n")
+cat("Variables:\n")
+print(variables_continuas)
+
+# Verificar que todas las variables existen en el dataset
+variables_existentes <- intersect(variables_continuas, names(dataset))
+variables_faltantes <- setdiff(variables_continuas, names(dataset))
+
+if(length(variables_faltantes) > 0) {
+  cat("\n⚠️ ADVERTENCIA: Variables no encontradas en dataset:\n")
+  print(variables_faltantes)
+}
+
+variables_continuas <- variables_existentes
+cat("\nVariables confirmadas en dataset:", length(variables_continuas), "\n")
+```
+
+```{r chunk11}
+#aplico la función a continuas
+dataset <- generar_lags_y_deltas(dataset, variables_continuas)
+
+cat("🎯 PROCESO COMPLETADO")
+cat("\n📊 Nuevas dimensiones del dataset:", dim(dataset))
+cat("\n💾 Dataset actualizado con lags y delta_lags de variables continuas\n")
+```
+
+```{r chunk12}
+# CONTROL RÁPIDO - Verificar lags y deltas generados
+
+# Variables lag y delta creadas
+variables_continuas_lag <- grep("_lag[0-9]+$", names(dataset), value = TRUE)
+variables_continuas_delta <- grep("_delta[0-9]+$", names(dataset), value = TRUE)
+
+cat("Lags creados:", length(variables_continuas_lag), "\n")
+cat("Deltas creados:", length(variables_continuas_delta), "\n")
+cat("Dimensiones dataset:", dim(dataset), "\n\n")
+
+# Ejemplo con un cliente específico
+cliente_ejemplo <- dataset$numero_de_cliente[1000]
+ejemplo <- dataset[numero_de_cliente == cliente_ejemplo,
+                   .(numero_de_cliente, foto_mes,
+                     mrentabilidad, mrentabilidad_lag1, mrentabilidad_lag2,
+                     mrentabilidad_delta1, mrentabilidad_delta2)]
+
+cat("=== EJEMPLO CLIENTE", cliente_ejemplo, "===\n")
+cat("Períodos del cliente:", nrow(ejemplo), "\n")
+print(ejemplo)
+
+# Verificar que los cálculos sean correctos
+cat("\n=== VERIFICACIÓN DELTA MANUAL ===\n")
+cat("mrentabilidad[2] - mrentabilidad_lag1[2] =",
+    ejemplo$mrentabilidad[2] - ejemplo$mrentabilidad_lag1[2], "\n")
+cat("mrentabilidad_delta1[2] =", ejemplo$mrentabilidad_delta1[2], "\n")
+cat("¿Coinciden?",
+    abs(ejemplo$mrentabilidad[2] - ejemplo$mrentabilidad_lag1[2] - ejemplo$mrentabilidad_delta1[2]) < 1e-10, "\n")
+
+# Conteo de NAs por variable
+cat("\n=== CONTEO NAs (primeras 5 variables) ===\n")
+for(var in head(variables_continuas, 5)) {
+  cat(var, ":", sum(is.na(dataset[[var]])), "NAs\n")
+  lag1 <- paste0(var, "_lag1")
+  delta1 <- paste0(var, "_delta1")
+  if(lag1 %in% names(dataset)) cat("  ", lag1, ":", sum(is.na(dataset[[lag1]])), "NAs\n")
+  if(delta1 %in% names(dataset)) cat("  ", delta1, ":", sum(is.na(dataset[[delta1]])), "NAs\n")
+}
+```
+
+```{r chunk13}
+# Variables a explorar = todas - (continuas (con sus lags y deltas), excluir)
+
+variables_explorar <- setdiff(names(dataset),
+                              c(variables_continuas, variables_excluir,
+                                variables_continuas_lag, variables_continuas_delta))
+
+cat("Variables continuas:", length(variables_continuas), "\n")
+cat("Variables excluir:", length(variables_excluir), "\n")
+cat("Variables continuas lag creadas:", length(variables_continuas_lag), "\n")
+cat("Variables continuas delta creadas:", length(variables_continuas_delta), "\n")
+cat("Variables a explorar:", length(variables_explorar), "\n")
+
+# Análisis detallado por niveles
+analisis_explorar <- data.table(
+  variable = variables_explorar,
+  tipo = sapply(dataset[, ..variables_explorar], function(x) class(x)[1]),
+  valores_unicos = sapply(dataset[, ..variables_explorar], function(x) length(unique(x[!is.na(x)]))),
+  nas = sapply(dataset[, ..variables_explorar], function(x) sum(is.na(x))),
+  min_val = sapply(dataset[, ..variables_explorar], function(x) min(x, na.rm = TRUE)),
+  max_val = sapply(dataset[, ..variables_explorar], function(x) max(x, na.rm = TRUE))
+)
+
+analisis_explorar <- analisis_explorar[order(valores_unicos)]
+print(analisis_explorar)
+```
+
+## v binarias
+```{r chunk14}
+# Variables binarias
+variables_binarias <- c(
+  "active_quarter", "cliente_vip", "cdescubierto_preacordado", "tcallcenter", "thomebanking", "tmobile_app", "Master_delinquency", "Visa_delinquency"
+)
+
+#tcuentas no va porque tiene tres valores 0, 1, 2
+#ccajas_transacciones  cantidad
+#cmobile_app_trx  cantidad
+
+cat("Total variables binarias:", length(variables_binarias), "\n\n")
+
+# Análisis detallado de cada binaria
+for(var in variables_binarias) {
+  cat("Variable:", var, "\n")
+
+  # Valores únicos y frecuencias
+  valores <- sort(unique(dataset[[var]][!is.na(dataset[[var]])]))
+  freq_table <- table(dataset[[var]], useNA = "ifany")
+
+  cat("  Valores:", paste(valores, collapse = ", "), "\n")
+  cat("  Distribución:", paste(names(freq_table), "=", as.numeric(freq_table), collapse = " | "), "\n")
+
+  # Recomendación para LightGBM
+  if(all(valores %in% c(0, 1))) {
+    cat("  ✅ LightGBM: Mantener como INTEGER (0/1)\n")
+  } else {
+    cat("  ⚠️ LightGBM: Considerar recodificar a 0/1\n")
+  }
+
+  cat("  📈 Lags: SÍ recomendado (captura cambios de estado temporal)\n")
+  cat("\n")
+}
+
+cat("=== RECOMENDACIÓN FINAL ===\n")
+cat("📊 LIGHTGBM: Mantener todas como INTEGER\n")
+cat("📈 LAGS: Aplicar a todas las", length(variables_binarias), "variables binarias\n")
+cat("⚡ RAZÓN: Variables binarias capturan estados que tienen continuidad temporal\n")
+```
+
+```{r chunk15}
+#aplico la función a binarias
+dataset <- generar_lags_y_deltas(dataset, variables_binarias)
+
+cat("🎯 PROCESO COMPLETADO")
+cat("\n📊 Nuevas dimensiones del dataset:", dim(dataset))
+cat("\n💾 Dataset actualizado con lags y delta_lags de variables binarias\n")
+```
+
+```{r chunk16}
+# CONTROL LAGS Y DELTAS DE BINARIAS
+
+# Variables lag y delta de binarias
+variables_binarias_lag <- grep(paste0("(", paste(variables_binarias, collapse = "|"), ")_lag[0-9]+$"),
+                     names(dataset), value = TRUE)
+variables_binarias_delta <- grep(paste0("(", paste(variables_binarias, collapse = "|"), ")_delta[0-9]+$"),
+                       names(dataset), value = TRUE)
+
+cat("=== RESUMEN VARIABLES BINARIAS ===\n")
+cat("Variables binarias originales:", length(variables_binarias), "\n")
+cat("Lags de binarias creados:", length(variables_binarias_lag), "\n")
+cat("Deltas de binarias creados:", length(variables_binarias_delta), "\n\n")
+
+cat("Dimensiones dataset:", dim(dataset), "\n\n")
+
+# Ejemplo con binaria
+if(length(variables_binarias_lag) > 0) {
+  cliente_ejemplo <- dataset$numero_de_cliente[1000]
+  var_ejemplo <- variables_binarias[1]  # Tomar primera binaria
+
+  ejemplo_binaria <- dataset[numero_de_cliente == cliente_ejemplo,
+                             c("numero_de_cliente", "foto_mes", var_ejemplo,
+                               paste0(var_ejemplo, "_lag1"), paste0(var_ejemplo, "_lag2"),
+                               paste0(var_ejemplo, "_delta1"), paste0(var_ejemplo, "_delta2")),
+                             with = FALSE]
+
+  cat("=== EJEMPLO BINARIA - CLIENTE", cliente_ejemplo, "- VARIABLE", var_ejemplo, "===\n")
+  cat("Períodos del cliente:", nrow(ejemplo_binaria), "\n")
+  print(ejemplo_binaria)
+
+  # Verificación delta binaria
+  cat("\n=== VERIFICACIÓN DELTA BINARIA ===\n")
+  if(nrow(ejemplo_binaria) >= 2) {
+    original_val <- ejemplo_binaria[[var_ejemplo]][2]
+    lag1_val <- ejemplo_binaria[[paste0(var_ejemplo, "_lag1")]][2]
+    delta1_val <- ejemplo_binaria[[paste0(var_ejemplo, "_delta1")]][2]
+
+    cat(var_ejemplo, "[2] - ", var_ejemplo, "_lag1[2] =", original_val - lag1_val, "\n")
+    cat(var_ejemplo, "_delta1[2] =", delta1_val, "\n")
+    cat("¿Coinciden?", abs((original_val - lag1_val) - delta1_val) < 1e-10, "\n\n")
+  }
+}
+
+# Conteo de NAs para binarias
+cat("=== CONTEO NAs VARIABLES BINARIAS (primeras 3) ===\n")
+for(var in head(variables_binarias, 3)) {
+  cat(var, ":", sum(is.na(dataset[[var]])), "NAs\n")
+  lag1 <- paste0(var, "_lag1")
+  delta1 <- paste0(var, "_delta1")
+  if(lag1 %in% names(dataset)) cat("  ", lag1, ":", sum(is.na(dataset[[lag1]])), "NAs\n")
+  if(delta1 %in% names(dataset)) cat("  ", delta1, ":", sum(is.na(dataset[[delta1]])), "NAs\n")
+}
+
+```
+
+## v discretas
+```{r chunk17}
+# Variables discretas = todas - (continuas (con sus deltas y lags), binarias (con sus deltas y lags), excluir)
+
+variables_discretas <- setdiff(names(dataset),
+                              c(variables_continuas, variables_excluir,
+                                variables_continuas_lag, variables_continuas_delta,
+                                variables_binarias, variables_binarias_lag, variables_binarias_delta
+                                ))
+
+cat("Variables continuas:", length(variables_continuas), "\n")
+cat("Variables excluir:", length(variables_excluir), "\n")
+cat("Variables binarias:", length(variables_binarias), "\n")
+cat("Variables lag continuas creadas:", length(variables_continuas_lag), "\n")
+cat("Variables delta continuas creadas:", length(variables_continuas_delta), "\n")
+cat("Variables lag binarias creadas:", length(variables_binarias_lag), "\n")
+cat("Variables delta binarias creadas:", length(variables_binarias_delta), "\n")
+cat("Variables discretas:", length(variables_discretas), "\n")
+
+# Análisis detallado por niveles
+analisis_discretas <- data.table(
+  variable = variables_discretas,
+  tipo = sapply(dataset[, ..variables_discretas], function(x) class(x)[1]),
+  valores_unicos = sapply(dataset[, ..variables_discretas], function(x) length(unique(x[!is.na(x)]))),
+  nas = sapply(dataset[, ..variables_discretas], function(x) sum(is.na(x))),
+  min_val = sapply(dataset[, ..variables_discretas], function(x) min(x, na.rm = TRUE)),
+  max_val = sapply(dataset[, ..variables_discretas], function(x) max(x, na.rm = TRUE))
+)
+
+analisis_discretas <- analisis_discretas[order(valores_unicos)]
+print(analisis_discretas)
+```
+
+```{r chunk18}
+#aplico la función a discretas
+dataset <- generar_lags_y_deltas(dataset, variables_discretas)
+
+cat("🎯 PROCESO COMPLETADO")
+cat("\n📊 Nuevas dimensiones del dataset:", dim(dataset))
+cat("\n💾 Dataset actualizado con lags y delta_lags de variables discretas\n")
+```
+
+```{r chunk19}
+# CONTROL LAGS Y DELTAS DISCRETAS
+
+
+# Variables lag y delta de discretas
+variables_discretas_lag <- grep(paste0("(", paste(variables_discretas, collapse = "|"), ")_lag[0-9]+$"),
+                      names(dataset), value = TRUE)
+variables_discretas_delta <- grep(paste0("(", paste(variables_discretas, collapse = "|"), ")_delta[0-9]+$"),
+                        names(dataset), value = TRUE)
+
+cat("=== RESUMEN VARIABLES DISCRETAS ===\n")
+cat("Variables discretas originales:", length(variables_discretas), "\n")
+cat("Lags de discretas creados:", length(variables_discretas_lag), "\n")
+cat("Deltas de discretas creados:", length(variables_discretas_delta), "\n\n")
+
+cat("Dimensiones dataset:", dim(dataset), "\n\n")
+
+# Ejemplo con discreta
+if(length(variables_discretas_lag) > 0) {
+  cliente_ejemplo <- dataset$numero_de_cliente[1000]
+  var_ejemplo <- variables_discretas[1]  # Tomar primera discreta
+
+  ejemplo_discreta <- dataset[numero_de_cliente == cliente_ejemplo,
+                              c("numero_de_cliente", "foto_mes", var_ejemplo,
+                                paste0(var_ejemplo, "_lag1"), paste0(var_ejemplo, "_lag2"),
+                                paste0(var_ejemplo, "_delta1"), paste0(var_ejemplo, "_delta2")),
+                              with = FALSE]
+
+  cat("=== EJEMPLO DISCRETA - CLIENTE", cliente_ejemplo, "- VARIABLE", var_ejemplo, "===\n")
+  cat("Períodos del cliente:", nrow(ejemplo_discreta), "\n")
+  print(ejemplo_discreta)
+
+  # Verificación delta discreta
+  cat("\n=== VERIFICACIÓN DELTA DISCRETA ===\n")
+  if(nrow(ejemplo_discreta) >= 2) {
+    original_val <- ejemplo_discreta[[var_ejemplo]][2]
+    lag1_val <- ejemplo_discreta[[paste0(var_ejemplo, "_lag1")]][2]
+    delta1_val <- ejemplo_discreta[[paste0(var_ejemplo, "_delta1")]][2]
+
+    cat(var_ejemplo, "[2] - ", var_ejemplo, "_lag1[2] =", original_val - lag1_val, "\n")
+    cat(var_ejemplo, "_delta1[2] =", delta1_val, "\n")
+    cat("¿Coinciden?", abs((original_val - lag1_val) - delta1_val) < 1e-10, "\n\n")
+  }
+}
+
+# Conteo de NAs para discretas
+cat("\n=== CONTEO NAs VARIABLES DISCRETAS (primeras 3) ===\n")
+for(var in head(variables_discretas, 3)) {
+  cat(var, ":", sum(is.na(dataset[[var]])), "NAs\n")
+  lag1 <- paste0(var, "_lag1")
+  delta1 <- paste0(var, "_delta1")
+  if(lag1 %in% names(dataset)) cat("  ", lag1, ":", sum(is.na(dataset[[lag1]])), "NAs\n")
+  if(delta1 %in% names(dataset)) cat("  ", delta1, ":", sum(is.na(dataset[[delta1]])), "NAs\n")
+}
+```
+
+## RESUMEN LAGS DELTAS
+```{r chunk20}
+total_lags <- length(grep("_lag[0-9]+$", names(dataset)))
+total_deltas <- length(grep("_delta[0-9]+$", names(dataset)))
+cat("\nTotal lags creados:", total_lags, "\n")
+cat("Total deltas creados:", total_deltas, "\n")
+
+cat("\nFINAL: Nuevas dimensiones del dataset con lags y deltas:", dim(dataset), "\n")
+cat("Total variables originales:", length(variables_continuas) + length(variables_binarias) + length(variables_discretas) + length(variables_excluir), "\n")
+cat("Total lags y deltas:", total_lags + total_deltas, "\n")
+cat("Suma total variables:", length(variables_continuas) + length(variables_binarias) + length(variables_discretas) + length(variables_excluir) + total_lags + total_deltas, "\n")
+cat("Multiplicador de variables:", round((dim(dataset)[2]) / (length(variables_continuas) + length(variables_binarias) + length(variables_discretas) + length(variables_excluir)), 1), "x\n")
+
+cat("Variables continuas originales:", length(variables_continuas), "\n")
+cat("Lags de continuas creados:", length(variables_continuas_lag), "\n")
+cat("Deltas de continuas creados:", length(variables_continuas_delta), "\n\n")
+
+cat("Variables binarias originales:", length(variables_binarias), "\n")
+cat("Lags de binarias creados:", length(variables_binarias_lag), "\n")
+cat("Deltas de binarias creados:", length(variables_binarias_delta), "\n\n")
+
+cat("Variables discretas originales:", length(variables_discretas), "\n")
+cat("Lags de discretas creados:", length(variables_discretas_lag), "\n")
+cat("Deltas de discretas creados:", length(variables_discretas_delta), "\n\n")
+
+cat("Variables a excluir originales:", length(variables_excluir), "\n")
+```
+
+```{r chunk21}
+dim(dataset)
+```
+
+```{r chunk22}
+getwd()
+```
+
+## fwrite competencia_01_fe.csv.gz
+```{r chunk23}
+# DESCARGAR DATASET ENGINEERED
+
+#guardo 1
+# fwrite( dataset,
+fwrite( dataset,
+    file =  "/content/datasets/competencia_01_fe.csv.gz",
+    sep = ","
+)
+
+#guardo 2
+# fwrite(dataset,
+fwrite(dataset,
+       file = "/content/buckets/b1/datasets/competencia_01_fe.csv.gz",
+       sep = ",")
+
+```
+
+```{r chunk24}
+nrow(dataset)
+ncol(dataset)
+```
+
+```{r chunk25}
+dataset[, .N, foto_mes]
+# dataset[foto_mes == 202101, .N, clase_ternaria]
+```
+
+```{r chunk26}
+colnames(dataset)
+```
+
+```{r chunk27}
+dataset[, .N, list(Visa_status, foto_mes)]
+```
+
+
+## RECIBIÓ_AGUINALDO
+clientes que tuvieron payroll en 04 y 06, tienen al menos 1 ctrxpayroll en junio y su mpayroll de junio es al menos 40% mayor que el de abril. (me quedan clientes con ctrxpayroll positivo sin asignar a la columna). Por lo tanto lo que identifico no son empleados, sino aproximo aguinaldos.
+```{r}
+
+#VERIFICACIÓN DE LAGS
+cat("VERIFICACIÓN DE LAGS\n")
+cliente_test <- dataset[foto_mes == 202106, numero_de_cliente][1]
+verificacion <- dataset[numero_de_cliente == cliente_test & foto_mes %in% c(202104, 202106),
+                        .(numero_de_cliente, foto_mes, mpayroll)]
+print(verificacion)
+
+lag2_correcto <- dataset[numero_de_cliente == cliente_test & foto_mes == 202106, mpayroll_lag2]
+valor_202104 <- dataset[numero_de_cliente == cliente_test & foto_mes == 202104, mpayroll]
+
+cat("\nLag2 en 202106:", lag2_correcto, "\n")
+cat("Valor real 202104:", valor_202104, "\n")
+cat("Coinciden:", isTRUE(all.equal(lag2_correcto, valor_202104)), "\n\n")
+
+# DETECCIÓN DE QUIEN RECIBIÓ AGUINALDO
+dataset[, recibio_aguinaldo := 0L]
+
+dataset[foto_mes == 202106, recibio_aguinaldo := ifelse(
+  cpayroll_trx_lag2 > 0 & #sueldo en abril
+  cpayroll_trx > 0 & #sueldo en junio
+  mpayroll > 1.4 * mpayroll_lag2 & #sueldo junio 40% mayor que abril
+  !is.na(mpayroll) & !is.na(mpayroll_lag2) & #sueldo abril y junio no NA
+  mpayroll > 0 & mpayroll_lag2 > 0, #sueldo abril y junio positivo
+  1L, 0L
+)]
+
+cat("\nDISTRIBUCIÓN DE 'recibio_aguinaldo' en 202106:\n")
+print(dataset[foto_mes == 202106, .N, by = recibio_aguinaldo])
+
+cat("\nDISTRIBUCIÓN cpayroll_trx:\n")
+print(dataset[foto_mes == 202106 & recibio_aguinaldo == 1, .N, by = cpayroll_trx])
+
+```
+
+## saldo normalizado
+
+los saldos normalizados representan cuánto tendrían en sus cuentas si hubieran mantenido el nivel de mayo. Se calcula restando del saldo de junio el delta positivo respecto a mayo (pmax(saldo_junio - saldo_mayo, 0)), asumiendo que ese incremento corresponde al aguinaldo depositado y no gastado inmediatamente. Para clientes sin aguinaldo o en otros meses, los saldos normalizados son idénticos a los originales.
+```{r}
+# #NORMALIZACIÓN DE SALDOS con estimación teórica del aguinaldo (no funcionó bien)
+# 
+# dataset[, mcaja_ahorro_normalizado := mcaja_ahorro]
+# dataset[, mcuentas_saldo_normalizado := mcuentas_saldo]
+# 
+# dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+#         aguinaldo_estimado := mpayroll * 0.35]
+# 
+# dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+#         mcaja_ahorro_normalizado := mcaja_ahorro - aguinaldo_estimado]
+# 
+# dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+#         mcuentas_saldo_normalizado := mcuentas_saldo - aguinaldo_estimado]
+
+```
+
+
+```{r}
+
+dataset[, mpayroll_normalizado := mpayroll]
+dataset[, mcuentas_saldo_normalizado := mcuentas_saldo]
+dataset[, mcaja_ahorro_normalizado := mcaja_ahorro]
+
+# Aguinaldo = incremento positivo de payroll entre mayo y junio
+dataset[foto_mes == 202106 & recibio_aguinaldo == 1,
+        aguinaldo_estimado := pmax(mpayroll_delta1, 0)] #pmax evito negativos
+
+# Normalizar restando el incremento
+dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+        mpayroll_normalizado := mpayroll - aguinaldo_estimado]
+
+dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+        mcaja_ahorro_normalizado := mcaja_ahorro - aguinaldo_estimado]
+
+dataset[foto_mes == 202106 & recibio_aguinaldo == 1,
+        mcuentas_saldo_normalizado := mcuentas_saldo - aguinaldo_estimado]
+```
+
+
+```{r}
+# No agrega es_empleado al dataset
+clientes_con_aguinaldo <- dataset[foto_mes == 202106 & recibio_aguinaldo == 1, 
+                                  unique(numero_de_cliente)]
+
+# Solo agregarla temporalmente para el cálculo
+evolucion <- dataset[, 
+                     .(mpayroll_prom = mean(mpayroll, na.rm = TRUE),
+                       mpayroll_norm_prom = mean(mpayroll_normalizado, na.rm = TRUE),
+                       mcaja_ahorro_prom = mean(mcaja_ahorro, na.rm = TRUE),
+                       mcaja_ahorro_norm_prom = mean(mcaja_ahorro_normalizado, na.rm = TRUE),
+                       mcuentas_saldo_prom = mean(mcuentas_saldo, na.rm = TRUE),
+                       mcuentas_saldo_norm_prom = mean(mcuentas_saldo_normalizado, na.rm = TRUE)),
+                     by = .(foto_mes, es_empleado = numero_de_cliente %in% clientes_con_aguinaldo)]
+
+# Gráfico o: mpayroll
+p0 <- ggplot(evolucion, aes(x = foto_mes, group = es_empleado)) +
+  geom_line(aes(y = mpayroll_prom, color = factor(es_empleado)), size = 1) +
+  geom_line(aes(y = mpayroll_norm_prom, color = factor(es_empleado)), 
+            linetype = "dashed", size = 1) +
+  geom_point(aes(y = mpayroll_prom, color = factor(es_empleado))) +
+  scale_color_manual(values = c("0" = "#E74C3C", "1" = "#3498DB"),
+                     labels = c("Sin aguinaldo", "Con aguinaldo")) +
+  labs(title = paste0("Evolución mpayroll - EXP ", PARAM$experimento),
+       subtitle = "Línea sólida: original | Línea punteada: normalizada",
+       x = "Período", y = "Saldo Promedio", color = "Grupo") +
+  theme_minimal()
+
+print(p0)
+
+# Gráfico 1: Caja Ahorro
+p1 <- ggplot(evolucion, aes(x = foto_mes, group = es_empleado)) +
+  geom_line(aes(y = mcaja_ahorro_prom, color = factor(es_empleado)), size = 1) +
+  geom_line(aes(y = mcaja_ahorro_norm_prom, color = factor(es_empleado)), 
+            linetype = "dashed", size = 1) +
+  geom_point(aes(y = mcaja_ahorro_prom, color = factor(es_empleado))) +
+  scale_color_manual(values = c("0" = "#E74C3C", "1" = "#3498DB"),
+                     labels = c("Sin aguinaldo", "Con aguinaldo")) +
+  labs(title = paste0("Evolución Caja Ahorro - EXP ", PARAM$experimento),
+       subtitle = "Línea sólida: original | Línea punteada: normalizada",
+       x = "Período", y = "Saldo Promedio", color = "Grupo") +
+  theme_minimal()
+
+print(p1)
+
+# Gráfico 2: Saldo Cuentas
+p2 <- ggplot(evolucion, aes(x = foto_mes, group = es_empleado)) +
+  geom_line(aes(y = mcuentas_saldo_prom, color = factor(es_empleado)), size = 1) +
+  geom_line(aes(y = mcuentas_saldo_norm_prom, color = factor(es_empleado)), 
+            linetype = "dashed", size = 1) +
+  geom_point(aes(y = mcuentas_saldo_prom, color = factor(es_empleado))) +
+  scale_color_manual(values = c("0" = "#E74C3C", "1" = "#3498DB"),
+                     labels = c("Sin aguinaldo", "Con aguinaldo")) +
+  labs(title = paste0("Evolución Saldo Cuentas - EXP ", PARAM$experimento),
+       subtitle = "Línea sólida: original | Línea punteada: normalizada",
+       x = "Período", y = "Saldo Promedio", color = "Grupo") +
+  theme_minimal()
+
+print(p2)
+```
+
+```{r}
+cat("EJEMPLOS DE CLIENTES QUE RECIBIERON AGUINALDO (recibio_aguinaldo == 1)\n\n")
+
+clientes_aguinaldo <- dataset[foto_mes == 202106 & recibio_aguinaldo == 1, numero_de_cliente][1:2]
+
+for(cliente in clientes_aguinaldo) {
+  cat("Cliente:", cliente, "\n")
+  ejemplo <- dataset[numero_de_cliente == cliente,
+                     .(foto_mes, 
+                       recibio_aguinaldo,
+                       mpayroll,
+                       cpayroll_trx,
+                       aguinaldo_estimado,
+                       mcaja_ahorro,
+                       mcaja_ahorro_normalizado,
+                       diferencia_caja = mcaja_ahorro - mcaja_ahorro_normalizado,
+                       mcuentas_saldo,
+                       mcuentas_saldo_normalizado,
+                       diferencia_cuentas = mcuentas_saldo - mcuentas_saldo_normalizado)]
+  print(ejemplo)
+  cat("\n")
+}
+
+cat("\nEJEMPLOS DE CLIENTES SIN AGUINALDO (recibio_aguinaldo == 0)\n\n")
+
+clientes_sin_aguinaldo <- dataset[foto_mes == 202106 & recibio_aguinaldo == 0, numero_de_cliente][1:2]
+
+for(cliente in clientes_sin_aguinaldo) {
+  cat("Cliente:", cliente, "\n")
+  ejemplo <- dataset[numero_de_cliente == cliente,
+                     .(foto_mes,
+                       recibio_aguinaldo,
+                       mpayroll,
+                       cpayroll_trx,
+                       aguinaldo_estimado,
+                       mcaja_ahorro,
+                       mcaja_ahorro_normalizado,
+                       diferencia_caja = mcaja_ahorro - mcaja_ahorro_normalizado,
+                       mcuentas_saldo,
+                       mcuentas_saldo_normalizado,
+                       diferencia_cuentas = mcuentas_saldo - mcuentas_saldo_normalizado)]
+  print(ejemplo)
+  cat("\n")
+}
+```
+
+```{r}
+# Ver valores concretos para empleados
+evolucion[es_empleado == 1, 
+          .(foto_mes, 
+            saldo_original = round(mcuentas_saldo_prom, 0),
+            saldo_normalizado = round(mcuentas_saldo_norm_prom, 0),
+            ajuste = round(mcuentas_saldo_prom - mcuentas_saldo_norm_prom, 0))]
+```
+
+```{r}
+# Guardar dataset con nuevas features
+
+# 1. RStudio local
+ruta_local <- file.path(dir_experimento, "competencia_01_fe2.csv.gz")
+fwrite(dataset, 
+       file = ruta_local,
+       sep = ",")
+cat("Dataset guardado en RStudio local:", ruta_local, "\n")
+
+# # 2. Google Cloud VM
+# ruta_vm <- "/content/buckets/b1/datasets/competencia_01_fe2.csv.gz"
+# fwrite(dataset,
+#        file = ruta_vm,
+#        sep = ",")
+# cat("Dataset guardado en VM:", ruta_vm, "\n")
+`_eliminar) := NULL]
+```
+
+
+# elimino deltas y lags
+```{r chunk66a}
+
+# Identificar columnas a eliminar
+columnas_eliminar <- grep("lag2|lag3|lag4|lag5|delta2|delta3|delta4|delta5", names(dataset), value = TRUE)
+
+# Visualizar las columnas que se van a eliminar
+print(paste("Total de columnas a eliminar:", length(columnas_eliminar)))
+print(columnas_eliminar)
+
+# Eliminar las columnas
+dataset[, (columnas_eliminar) := NULL]
+```
+
+```{r chunk67a}
+dim(dataset)
+```
+
+# 2.2 Optimizacion Hiperparámetros
+Esta parte se debe correr con el runtime en lenguaje R Ir al menu, Runtime -> Change Runtime Type -> Runtime type -> R
+### 2.2.1 Inicio
+limpio el ambiente de R
+
+```{r chunk28}
+format(Sys.time(), "%a %b %d %X %Y")
+```
+
+```{r chunk29}
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+```
+
+### 2.2.2 Carga de Librerias
+Esta parte lleva varios minutos la primera vez en Google Colab
+```{r chunk30}
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+
+if( !require("lightgbm") ) install.packages("lightgbm")
+require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+```
+
+### 2.2.3 Definicion de Parametros
+aqui debe cargar SU semilla primigenia
+<br>recuerde cambiar el numero de experimento en cada corrida nueva
+# nro EXP
+
+```{r chunk31}
+PARAM <- list()
+PARAM$experimento <- 9006
+
+PARAM$semilla_primigenia <- 999199
+PARAM$semillas <- c(999199, 999499, 999599, 999959, 999979, 104729, 523987
+                    #, 7919,1299709, 2097593
+)
+# semillas <- c(999199, 999499, 999599, 999959, 999979, 104729, 523987, 7919,1299709, 2097593 )
+```
+
+```{r chunk32}
+# # training y future
+# PARAM$train <- c(202102)
+# PARAM$train_final <- c(202102)
+# PARAM$future <- c(202104)
+# PARAM$semilla_kaggle <- 314159
+# PARAM$cortes <- seq(6000, 19000, by= 500)
+```
+
+```{r chunk33}
+# training y future
+PARAM$train <- c(202101, 202102, 202103)
+PARAM$train_final <- c(202102, 202101, 202103)
+PARAM$future <- c(202106)
+PARAM$false_future <- c(202104)
+PARAM$semilla_kaggle <- 314159
+PARAM$cortes <- seq(6000, 18000, by= 500)
+```
+
+```{r chunk34}
+# un undersampling de 0.1  toma solo el 10% de los CONTINUA
+# undersampling de 1.0  implica tomar TODOS los datos
+
+PARAM$trainingstrategy$undersampling <- 0.2
+```
+
+# HIPERPARAMETROS
+```{r chunk35}
+# Parametros LightGBM
+
+PARAM$hyperparametertuning$xval_folds <- 5
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  # boosting= "dart", #ATENCION MODIFIQUE
+  objective= "binary",
+  metric= "auc",
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  feature_pre_filter= FALSE,
+  force_row_wise= TRUE, # para reducir warnings
+  verbosity= -100,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L, # -1 significa no limitar,  por ahora lo dejo fijo
+  min_gain_to_split= 0, # min_gain_to_split >= 0
+  min_sum_hessian_in_leaf= 0.001, #  min_sum_hessian_in_leaf >= 0.0
+  lambda_l1= 0.0, # lambda_l1 >= 0.0
+  lambda_l2= 0.0, # lambda_l2 >= 0.0
+  max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+  bagging_fraction= 1.0, # 0.0 < bagging_fraction <= 1.0
+  pos_bagging_fraction= 1.0, # 0.0 < pos_bagging_fraction <= 1.0
+  neg_bagging_fraction= 1.0, # 0.0 < neg_bagging_fraction <= 1.0
+  is_unbalance= FALSE, #
+  scale_pos_weight= 1.0, # scale_pos_weight > 0.0
+
+  drop_rate= 0.1, # 0.0 < neg_bagging_fraction <= 1.0
+  max_drop= 50, # <=0 means no limit
+  skip_drop= 0.5, # 0.0 <= skip_drop <= 1.0
+
+  extra_trees= FALSE,
+
+  num_iterations= 1200,
+  learning_rate= 0.02,
+  feature_fraction= 0.5,
+  num_leaves= 750,
+  min_data_in_leaf= 5000
+)
+```
+
+Aqui se definen los hiperparámetros de LightGBM que participan de la Bayesian Optimization
+<br> si es un numero entero debe ir  makeIntegerParam
+<br> si es un numero real (con decimales) debe ir  makeNumericParam
+<br> es muy importante leer cuales son un lower y upper  permitidos y ademas razonables
+```{r chunk36}
+# # Aqui se cargan los bordes de los hiperparametros de la BO
+# # INICIAL EXP HT4940
+
+# PARAM$hyperparametertuning$hs <- makeParamSet(
+#   makeIntegerParam("num_iterations", lower= 8L, upper= 2048L),
+#   makeNumericParam("learning_rate", lower= 0.01, upper= 0.3),
+#   makeNumericParam("feature_fraction", lower= 0.1, upper= 1.0),
+#   makeIntegerParam("num_leaves", lower= 8L, upper= 2048L),
+#   makeIntegerParam("min_data_in_leaf", lower= 1L, upper= 8000L)
+# )
+```
+
+```{r chunk37}
+# # EXP 9000
+
+# PARAM$hyperparametertuning$hs <- makeParamSet(
+#   makeIntegerParam("num_iterations", lower= 250L, upper= 5000L),
+#   # o más con early stopping al entrenar
+#   makeNumericParam("learning_rate", lower= 0.005, upper= 0.2),
+#   makeNumericParam("feature_fraction", lower= 0.2, upper= 0.99),
+#   makeIntegerParam("num_leaves", lower= 64L, upper= 1000L),
+#   makeIntegerParam("min_data_in_leaf", lower= 50L, upper= 3000L),
+
+#   makeIntegerParam("max_depth", lower = 3, upper= 26),
+#   makeNumericParam("min_gain_to_split", lower = 0.0, upper = 0.4),
+#   #makeNumericParam("min_sum_hessian_in_leaf", lower = 0.001, upper = 0.1),
+#   makeNumericParam("lambda_l1", lower = 0.0, upper = 5.0),
+#   makeNumericParam("lambda_l2", lower = 0.0, upper = 10.0),
+#   #max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+#   makeNumericParam("bagging_fraction", lower = 0.2, upper = 0.99),
+#   makeIntegerParam("bagging_freq", lower = 1L, upper = 7L) #1 para que ocurra
+#   #makeNumericParam("pos_bagging_fraction", lower = 0.5, upper = 1.0),
+#   #makeNumericParam("neg_bagging_fraction", lower = 0.5, upper = 1.0),
+#   #makeNumericParam("scale_pos_weight", lower = 0.5, upper = 1.0),
+
+# #son de dart
+#   # makeNumericParam("drop_rate", lower = 0.0, upper = 0.3),
+#   # makeIntegerParam("max_drop", lower = 0L, upper = 50L),
+#   # makeNumericParam("skip_drop", lower = 0.1, upper = 0.5)
+# )
+```
+
+```{r chunk38}
+# Estos recomienda Gustavo competencia 1
+
+# num_iterations,
+# learning_rate,
+# feature_fraction,
+# num_leaves,
+# min_data_in_leaf = 3
+```
+
+
+```{r nuevos}
+# EXP 9006
+
+PARAM$hyperparametertuning$hs <- makeParamSet(
+  makeIntegerParam("num_iterations", lower= 250L, upper= 5000L),
+  makeNumericParam("learning_rate", lower= 0.005, upper= 0.1),
+  makeNumericParam("feature_fraction", lower= 0.2, upper= 0.99),
+  makeIntegerParam("num_leaves", lower= 64L, upper= 1000L),
+  makeIntegerParam("min_data_in_leaf", lower= 2L, upper= 5L)
+)
+```
+
+
+```{r chunk39}
+# # EXP 9002
+# 
+# PARAM$hyperparametertuning$hs <- makeParamSet(
+#   makeIntegerParam("num_iterations", lower= 250L, upper= 5000L),
+#   # o más con early stopping al entrenar
+#   makeNumericParam("learning_rate", lower= 0.005, upper= 0.1),
+#   makeNumericParam("feature_fraction", lower= 0.2, upper= 0.99),
+#   makeIntegerParam("num_leaves", lower= 64L, upper= 1000L),
+#   makeIntegerParam("min_data_in_leaf", lower= 2L, upper= 5L),
+# 
+#   makeIntegerParam("max_depth", lower = 3, upper= 26),
+#   makeNumericParam("min_gain_to_split", lower = 0.0, upper = 0.4),
+#   #makeNumericParam("min_sum_hessian_in_leaf", lower = 0.001, upper = 0.1),
+#   makeNumericParam("lambda_l1", lower = 0.0, upper = 5.0),
+#   makeNumericParam("lambda_l2", lower = 0.0, upper = 10.0),
+#   #max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+# 
+#   makeNumericParam("bagging_fraction", lower = 0.2, upper = 0.99),
+#   makeIntegerParam("bagging_freq", lower = 1L, upper = 7L) #1 para que ocurra
+#   #makeNumericParam("pos_bagging_fraction", lower = 0.5, upper = 1.0),
+#   #makeNumericParam("neg_bagging_fraction", lower = 0.5, upper = 1.0),
+#   #makeNumericParam("scale_pos_weight", lower = 0.5, upper = 1.0),
+# 
+# #son de dart
+#   # makeNumericParam("drop_rate", lower = 0.0, upper = 0.3),
+#   # makeIntegerParam("max_drop", lower = 0L, upper = 50L),
+#   # makeNumericParam("skip_drop", lower = 0.1, upper = 0.5)
+# )
+```
+
+```{r chunk40}
+# # EXP HT 4942
+
+# PARAM$hyperparametertuning$hs <- makeParamSet(
+#   makeIntegerParam("num_iterations", lower= 100L, upper= 5000L),
+#   # o más con early stopping al entrenar
+#   makeNumericParam("learning_rate", lower= 0.01, upper= 0.1),
+#   makeNumericParam("feature_fraction", lower= 0.3, upper= 1.0),
+#   makeIntegerParam("num_leaves", lower= 64L, upper= 2000),
+#   makeIntegerParam("min_data_in_leaf", lower= 50L, upper= 3000L),
+
+#   # makeIntegerParam("max_depth", lower = 3, upper= 30),
+#   makeNumericParam("min_gain_to_split", lower = 0.0, upper = 0.4),
+#   makeNumericParam("min_sum_hessian_in_leaf", lower = 0.001, upper = 0.1),
+#   makeNumericParam("lambda_l1", lower = 0.0, upper = 10.0),
+#   makeNumericParam("lambda_l2", lower = 0.0, upper = 10.0),
+#   #max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+#   makeNumericParam("bagging_fraction", lower = 0.5, upper = 0.999),
+#   makeIntegerParam("bagging_freq", lower = 1L, upper = 7L),
+#   #makeNumericParam("pos_bagging_fraction", lower = 0.5, upper = 1.0),
+#   #makeNumericParam("neg_bagging_fraction", lower = 0.5, upper = 1.0),
+#   makeNumericParam("scale_pos_weight", lower = 20.0, upper = 40.0),
+
+# #son de dart
+#   makeNumericParam("drop_rate", lower = 0.0, upper = 0.3),
+#   makeIntegerParam("max_drop", lower = 0L, upper = 50L),
+#   makeNumericParam("skip_drop", lower = 0.1, upper = 0.5)
+# )
+```
+
+A mayor cantidad de hiperparámetros, se debe aumentar las iteraciones de la Bayesian Optimization
+<br> 30 es un valor muy tacaño, pero corre rápido
+<br> deberia partir de 50, alcanzando los 100 si se dispone de tiempo
+
+```{r chunk41}
+
+PARAM$hyperparametertuning$iteraciones <- 50 # iteraciones bayesianas
+
+```
+
+# Preprocesamiento
+```{r chunk42}
+
+# carpeta de trabajo
+# 
+# setwd("/content/buckets/b1/exp")
+# experimento_folder <- paste0("HT", PARAM$experimento)
+# dir.create(experimento_folder, showWarnings=FALSE)
+# setwd( paste0("/content/buckets/b1/exp/", experimento_folder ))
+
+
+ # PARA R
+ # Definir directorio base
+dir_base <- "C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/experimentos"
+dir.create(dir_base, showWarnings = FALSE, recursive = TRUE)
+# # Crear directorio exp
+experimento <- paste0("exp", PARAM$experimento)
+dir_experimento <- file.path(dir_base, experimento)
+dir.create(dir_experimento, showWarnings = FALSE)
+# # Crear directorio HT dentro de exp
+HT <- paste0("HT", PARAM$experimento)
+dir_HT <- file.path(dir_experimento, HT)
+dir.create(dir_HT, showWarnings = FALSE)
+# # Cambiar al directorio HT
+setwd(dir_HT)
+# # Verificar
+cat("Directorio de trabajo:", getwd(), "\n")
+```
+
+```{r chunk43}
+# # lectura del dataset
+# # dataset <- fread("/content/datasets/competencia_01.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01.csv.gz", stringsAsFactors= TRUE)
+
+# # lectura del dataset
+# # dataset <- fread("/content/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+
+# # lectura dataset otra
+# dataset <- fread("/content/buckets/b1/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+dataset <- fread("competencia_01_fe2.csv.gz", stringsAsFactors= TRUE)
+
+# # # lectura del dataset
+# # dataset <- fread("/content/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# # fwrite(dataset, file = "/content/datasets/competencia_01_fe.csv")
+# fwrite(dataset, file = "C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv")
+
+# #para VM no acepta gz
+# # dataset <- fread("/content/datasets/competencia_01_fe.csv", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv", stringsAsFactors= TRUE)
+
+```
+
+```{r chunk44}
+
+dim(dataset)
+```
+
+```{r chunk45}
+# Identificar columnas a eliminar
+columnas_eliminar <- grep("lag2|lag3|lag4|lag5|delta2|delta3|delta4|delta5", names(dataset), value = TRUE)
+
+# Visualizar las columnas que se van a eliminar
+print(paste("Total de columnas a eliminar:", length(columnas_eliminar)))
+print(columnas_eliminar)
+
+# Eliminar las columnas
+dataset[, (columnas_eliminar) := NULL]
+```
+
+```{r chunk46}
+
+dim(dataset)
+```
+
+### define foto mes y clase
+```{r chunk47}
+
+dataset_train <- dataset[foto_mes %in% PARAM$train]
+```
+
+```{r chunk48}
+
+# paso la clase a binaria que tome valores {0,1}  enteros
+#  BAJA+1 y BAJA+2  son  1,   CONTINUA es 0
+#  a partir de ahora ya NO puedo cortar  por prob(BAJA+2) > 1/40
+
+dataset_train[,
+  clase01 := ifelse(clase_ternaria %in% c("BAJA+2","BAJA+1"), 1L, 0L)
+]
+```
+
+```{r chunk49}
+
+# defino los datos que forma parte del training
+# aqui se hace el undersampling de los CONTINUA
+# notar que para esto utilizo la SEGUNDA semilla
+
+set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
+dataset_train[, azar := runif(nrow(dataset_train))]
+dataset_train[, training := 0L]
+
+dataset_train[
+  foto_mes %in%  PARAM$train &
+    (azar <= PARAM$trainingstrategy$undersampling | clase_ternaria %in% c("BAJA+1", "BAJA+2")),
+  training := 1L
+]
+```
+
+```{r chunk50}
+
+# los campos que se van a utilizar
+
+campos_buenos <- setdiff(
+  colnames(dataset_train),
+  c("clase_ternaria", "clase01", "azar", "training")
+)
+```
+
+```{r chunk51}
+
+# dejo los datos en el formato que necesita LightGBM
+
+dtrain <- lgb.Dataset(
+  data= data.matrix(dataset_train[training == 1L, campos_buenos, with= FALSE]),
+  label= dataset_train[training == 1L, clase01],
+  free_raw_data= FALSE
+)
+
+nrow(dtrain)
+ncol(dtrain)
+```
+
+2.2.5 Configuracion Bayesian Optimization
+```{r chunk52}
+
+# En el argumento x llegan los parámetros de la bayesiana
+#  devuelve la AUC en cross validation del modelo entrenado
+
+EstimarGanancia_AUC_lightgbm <- function(x) {
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, x)
+
+  # entreno LightGBM
+  modelocv <- lgb.cv(
+    data= dtrain,
+    nfold= PARAM$hyperparametertuning$xval_folds,
+    stratified= TRUE,
+    param= param_completo
+  )
+
+  # obtengo la ganancia
+  AUC <- modelocv$best_score
+
+  # hago espacio en la memoria
+  rm(modelocv)
+  gc(full= TRUE, verbose= FALSE)
+
+  message(format(Sys.time(), "%a %b %d %X %Y"), " AUC ", AUC)
+
+  return(AUC)
+}
+```
+
+
+```{r chunk53}
+
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+# en este archivo quedan la evolucion binaria de la BO
+#para VM
+# kbayesiana <- "bayesiana.RDATA"
+
+#para Rstudio
+kbayesiana <- file.path(dir_experimento, "bayesiana.RDATA")
+
+
+funcion_optimizar <- EstimarGanancia_AUC_lightgbm # la funcion que voy a maximizar
+
+configureMlr(show.learner.output= FALSE)
+
+# configuro la busqueda bayesiana,  los hiperparametros que se van a optimizar
+# por favor, no desesperarse por lo complejo
+
+obj.fun <- makeSingleObjectiveFunction(
+  fn= funcion_optimizar, # la funcion que voy a maximizar
+  minimize= FALSE, # estoy Maximizando la ganancia
+  noisy= TRUE,
+  par.set= PARAM$hyperparametertuning$hs, # definido al comienzo del programa
+  has.simple.signature= FALSE # paso los parametros en una lista
+)
+
+# cada 600 segundos guardo el resultado intermedio
+ctrl <- makeMBOControl(
+  save.on.disk.at.time= 600, # se graba cada 600 segundos
+  save.file.path= kbayesiana
+) # se graba cada 600 segundos
+
+# indico la cantidad de iteraciones que va a tener la Bayesian Optimization
+ctrl <- setMBOControlTermination(
+  ctrl,
+  iters= PARAM$hyperparametertuning$iteraciones
+) # cantidad de iteraciones
+
+# defino el método estandar para la creacion de los puntos iniciales,
+# los "No Inteligentes"
+ctrl <- setMBOControlInfill(ctrl, crit= makeMBOInfillCritEI())
+
+# establezco la funcion que busca el maximo
+surr.km <- makeLearner(
+  "regr.km",
+  predict.type= "se",
+  covtype= "matern3_2",
+  control= list(trace= TRUE)
+)
+```
+
+2.2.6 Corrida Bayesian Optimization
+```{r chunk54}
+
+ # inicio la optimizacion bayesiana, retomando si ya existe
+# es la celda mas lenta de todo el notebook
+
+if (!file.exists(kbayesiana)) {
+  bayesiana_salida <- mbo(obj.fun, learner= surr.km, control= ctrl)
+} else {
+  bayesiana_salida <- mboContinue(kbayesiana) # retomo en caso que ya exista
+}
+```
+
+```{r chunk55}
+
+print(bayesiana_salida$x)  # Mejores hiperparámetros
+print(bayesiana_salida$y)  # Mejor AUC
+```
+
+##LEVANTO PROCESO INTERRUMPIDO
+```{r chunk56}
+
+# # levantar proceso interrumpido sin continuar
+
+# load(kbayesiana)  # carga 'opt.state' en el entorno
+
+# # armo un contenedor con el mismo campo que usaba
+# bayesiana_salida <- list(opt.path = opt.state$opt.path)
+
+# print(bayesiana_salida$x)  # Mejores hiperparámetros
+# print(bayesiana_salida$y)  # Mejor AUC
+```
+
+```{r chunk57}
+
+
+tb_bayesiana <- as.data.table(bayesiana_salida$opt.path)
+colnames( tb_bayesiana)
+```
+
+```{r chunk58}
+
+# almaceno los resultados de la Bayesian Optimization
+# y capturo los mejores hiperparametros encontrados
+
+tb_bayesiana <- as.data.table(bayesiana_salida$opt.path) #(ya está en la celda anterior)
+
+tb_bayesiana[, iter := .I]
+
+# ordeno en forma descendente por AUC = y
+setorder(tb_bayesiana, -y)
+
+# grabo para eventualmente poder utilizarlos en OTRA corrida
+# 
+# fwrite( tb_bayesiana,
+#   file= "BO_log.txt",
+#   sep= "\t"
+# )
+
+#grabo para Rstudio
+ruta_bo <- file.path(dir_experimento, "BO_log.txt")
+fwrite(tb_bayesiana,
+  file = ruta_bo,
+  sep = "\t"
+)
+
+# los mejores hiperparámetros son los que quedaron en el registro 1 de la tabla
+PARAM$out$lgbm$mejores_hiperparametros <- tb_bayesiana[
+  1, # el primero es el de mejor AUC
+  setdiff(colnames(tb_bayesiana),
+    c("y","dob","eol","error.message","exec.time","ei","error.model",
+      "train.time","prop.type","propose.time","se","mean","iter")),
+  with= FALSE
+]
+
+
+PARAM$out$lgbm$y <- tb_bayesiana[1, y]
+```
+
+```{r chunk59}
+
+write_yaml( PARAM, file="PARAM.yml")
+```
+
+```{r chunk60}
+
+print(PARAM$out$lgbm$mejores_hiperparametros)
+print(PARAM$out$lgbm$y)
+```
+
+```{r chunk61}
+# EXP HT 4940
+# Envios=9000	 TOTAL=353600000  Public=335333333 Private=361428571
+  # mejores_hiperparametros:
+  #       num_iterations: 1085
+  #       learning_rate: 0.0100625
+  #       feature_fraction: 0.5160196
+  #       num_leaves: 1838
+  #       min_data_in_leaf: 1309
+```
+
+```{r chunk62}
+# EXP HT 4941
+
+# mejores_hiperparametros:
+#       num_iterations: 962
+#       learning_rate: 0.0144182
+#       feature_fraction: 0.6585625
+#       num_leaves: 365
+#       min_data_in_leaf: 726
+#       max_depth: 23
+#       min_gain_to_split: 0.0570174
+#       lambda_l1: 3.9986413
+#       lambda_l2: 1.7045828
+```
+
+```{r chunk63}
+# EXP HT 4942
+
+# num_iterations 4593
+# learning_rate 0.0427741
+# feature_fraction 0.3755552
+# num_leaves 1910
+# min_data_in_leaf 2195
+# min_gain_to_split 0.08282231
+# min_sum_hessian_in_leaf 0.08637694
+# lambda_l1 0.8836508
+# lambda_l2 4.757157
+# bagging_fraction 0.9806646
+# bagging_freq 1
+# scale_pos_weight 34.63562
+# drop_rate 0.08215384
+# max_drop 1
+# skip_drop 0.3466582
+# AUC 0.925877
+```
+
+# Produccion
+### Final Training
+Construyo el modelo final, que es uno solo, no hace ningun tipo de particion < training, validation, testing>]
+```{r chunk64}
+
+# setwd("/content/buckets/b1/exp")
+# experimento <- paste0("exp", PARAM$experimento)
+# dir.create(experimento, showWarnings= FALSE)
+# setwd( paste0("/content/buckets/b1/exp/", experimento ))
+
+# Definir directorio base para RStudio (ajustalo a tu ruta local)
+dir_base <- "C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/experimentos"
+
+# Crear directorio base si no existe
+dir.create(dir_base, showWarnings = FALSE, recursive = TRUE)
+
+# Crear directorio del experimento
+experimento <- paste0("exp", PARAM$experimento)
+dir_experimento <- file.path(dir_base, experimento)
+dir.create(dir_experimento, showWarnings = FALSE)
+
+# Cambiar al directorio del experimento
+setwd(dir_experimento)
+
+# Verificar
+cat("Directorio de trabajo:", getwd(), "\n")
+```
+
+#### Final Training Dataset
+
+Aqui esta la gran decision de en qué meses hago el Final Training
+<br> debo utilizar los mejores hiperparámetros que encontré en la  optimización bayesiana
+```{r chunk65}
+# # lectura del dataset
+# # dataset <- fread("/content/buckets/b1/datasets/competencia_01.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/resultados/datasets/competencia_01.csv.gz", stringsAsFactors= TRUE)
+
+# # lectura del dataset
+# # dataset <- fread("/content/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+
+# # lectura dataset otra
+# dataset <- fread("/content/buckets/b1/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+
+dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+
+# # lectura del dataset
+# dataset <- fread("/content/datasets/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv.gz", stringsAsFactors= TRUE)
+# fwrite(dataset, file = "/content/datasets/competencia_01_fe.csv")
+# fwrite(dataset, file = "C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv")
+
+#para VM no acepta gz
+# dataset <- fread("/content/datasets/competencia_01_fe.csv", stringsAsFactors= TRUE)
+# dataset <- fread("C:/Users/Silvana/Documents/Maestria Exactas/DMEyF/competencia 1/datos/competencia_01_fe.csv", stringsAsFactors= TRUE)
+```
+```{r}
+cat("VERIFICACIÓN POST-CARGA\n\n")
+
+cat("Dimensiones totales:", dim(dataset), "\n\n")
+
+cat("Distribución por foto_mes:\n")
+print(dataset[, .N, by = foto_mes][order(foto_mes)])
+
+cat("\nPERÍODO 202106\n")
+cat("Filas en 202106:", nrow(dataset[foto_mes == 202106]), "\n")
+cat("Esperado: 164313\n")
+
+if(nrow(dataset[foto_mes == 202106]) != 164313) {
+  cat("\nPROBLEMA AL CARGAR\n")
+  cat("Diferencia:", 164313 - nrow(dataset[foto_mes == 202106]), "registros faltantes\n")
+  cat("El archivo competencia_01_fe.csv ya tiene el problema\n")
+  cat("Revisar cómo se generó el feature engineering\n")
+} else {
+  cat("\nCarga correcta - 202106 OK\n")
+}
+```
+
+```{r chunk66}
+
+# Identificar columnas a eliminar
+columnas_eliminar <- grep("lag2|lag3|lag4|lag5|delta2|delta3|delta4|delta5", names(dataset), value = TRUE)
+
+# Visualizar las columnas que se van a eliminar
+print(paste("Total de columnas a eliminar:", length(columnas_eliminar)))
+print(columnas_eliminar)
+
+# Eliminar las columnas
+dataset[, (columnas_eliminar) := NULL]
+```
+
+```{r chunk67}
+dim(dataset)
+```
+
+```{r chunk68}
+# clase01
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+```
+
+```{r chunk69}
+dataset_train <- dataset[foto_mes %in% PARAM$train_final]
+dataset_train[,.N,clase_ternaria]
+```
+
+```{r chunk70}
+# los campos que se van a utilizar
+
+campos_buenos <- setdiff(
+  colnames(dataset_train),
+  c("clase_ternaria", "clase01", "azar", "training")
+)
+```
+
+```{r chunk71}
+# dejo los datos en el formato que necesita LightGBM
+
+dtrain_final <- lgb.Dataset(
+  data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+  label= dataset_train[, clase01]
+)
+```
+
+#### Final Training Hyperparameters
+```{r chunk72}
+# Parametros LightGBM
+
+PARAM$hyperparametertuning$xval_folds <- 5
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  # boosting= "dart", #ATENCION MODIFIQUE
+  objective= "binary",
+  metric= "auc",
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  feature_pre_filter= FALSE,
+  force_row_wise= TRUE, # para reducir warnings
+  verbosity= -100,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L, # -1 significa no limitar,  por ahora lo dejo fijo
+  min_gain_to_split= 0, # min_gain_to_split >= 0
+  min_sum_hessian_in_leaf= 0.001, #  min_sum_hessian_in_leaf >= 0.0
+  lambda_l1= 0.0, # lambda_l1 >= 0.0
+  lambda_l2= 0.0, # lambda_l2 >= 0.0
+  max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+  bagging_fraction= 1.0, # 0.0 < bagging_fraction <= 1.0
+  pos_bagging_fraction= 1.0, # 0.0 < pos_bagging_fraction <= 1.0
+  neg_bagging_fraction= 1.0, # 0.0 < neg_bagging_fraction <= 1.0
+  is_unbalance= FALSE, #
+  scale_pos_weight= 1.0, # scale_pos_weight > 0.0
+
+  drop_rate= 0.1, # 0.0 < neg_bagging_fraction <= 1.0
+  max_drop= 50, # <=0 means no limit
+  skip_drop= 0.5, # 0.0 <= skip_drop <= 1.0
+
+  extra_trees= FALSE,
+
+  num_iterations= 1200,
+  learning_rate= 0.02,
+  feature_fraction= 0.5,
+  num_leaves= 750,
+  min_data_in_leaf= 5000
+)
+```
+
+```{r chunk73}
+
+# # 9002 bayesiana AUC =  0.9441 
+# PARAM$out$lgbm$mejores_hiperparametros <- list(
+#   num_iterations = 4710,
+#   learning_rate = 0.00775,
+#   feature_fraction = 0.853,
+#   num_leaves = 264,
+#   min_data_in_leaf = 3,
+#   max_depth = 15,
+#   min_gain_to_split = 6.27e-05,
+#   lambda_l1 = 0.0249,
+#   lambda_l2 = 1.73,
+#   bagging_fraction = 0.809,
+#   bagging_freq = 2
+# )
+```
+
+```{r chunk74}
+# #celda agregada por sil 25/9 para probar mejores hiperparametros so far4940 con dataset_fe
+
+# mejores_hiperparametros_ht4940 <- list(
+#   num_iterations = 1085,
+#   learning_rate = 0.0100625,
+#   feature_fraction = 0.5160196,
+#   num_leaves = 1838,
+#   min_data_in_leaf = 1309
+# )
+
+# param_final <- modifyList(PARAM$lgbm$param_fijos, mejores_hiperparametros_ht4940)
+```
+
+```{r chunk75}
+param_final <- modifyList(PARAM$lgbm$param_fijos,
+  PARAM$out$lgbm$mejores_hiperparametros)
+
+param_final
+```
+
+##semillas para preparar ensamble
+```{r chunk76}
+#Solo si uso ensamble creo que no sería necesario luego de haber corregido el codigo. revisar
+
+param_final$seed <- PARAM$semillas
+```
+
+```{r chunk77}
+# este punto es muy SUTIL  y será revisado en la Clase 05
+# acá retoma esto PARAM$trainingstrategy$undersampling ojo no haber borrado
+
+param_normalizado <- copy(param_final)
+param_normalizado$min_data_in_leaf <-  round(param_final$min_data_in_leaf / PARAM$trainingstrategy$undersampling)
+```
+
+```{r chunk78}
+param_normalizado
+```
+
+
+```{r}
+cat("=== VERIFICACIÓN CRÍTICA dtrain_final ===\n\n")
+
+# 1. Dimensiones
+cat("1. DIMENSIONES:\n")
+cat("   Filas:", nrow(dtrain_final), "\n")
+cat("   Columnas:", ncol(dtrain_final), "\n\n")
+
+# 2. Verificar que corresponde a los períodos correctos
+cat("2. PERÍODOS DE ENTRENAMIENTO:\n")
+cat("   Configurados:", paste(PARAM$train_final, collapse = ", "), "\n")
+dataset_train_check <- dataset[foto_mes %in% PARAM$train_final]
+cat("   Filas en dataset para esos períodos:", nrow(dataset_train_check), "\n")
+cat("   ¿Coincide con dtrain_final?", nrow(dataset_train_check) == nrow(dtrain_final), "\n\n")
+
+# 3. Distribución de períodos
+cat("3. DISTRIBUCIÓN POR PERÍODO:\n")
+print(dataset_train_check[, .N, by = foto_mes])
+cat("\n")
+
+# 4. Balance de clases
+cat("4. BALANCE DE CLASES:\n")
+dataset_train_check[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+print(dataset_train_check[, .N, by = clase01])
+cat("   Proporción positivos:", 
+    round(sum(dataset_train_check$clase01) / nrow(dataset_train_check) * 100, 2), "%\n\n")
+
+# 5. Verificar datos del modelo
+cat("5. CALIDAD DE DATOS:\n")
+data_check <- data.matrix(dataset_train_check[, campos_buenos, with = FALSE])
+cat("   NAs:", sum(is.na(data_check)), "\n")
+cat("   Infinitos:", sum(is.infinite(data_check)), "\n")
+cat("   Labels NAs:", sum(is.na(dataset_train_check$clase01)), "\n\n")
+
+# 6. Verificar future (donde vas a predecir)
+cat("6. FUTURO A PREDECIR:\n")
+dfuture <- dataset[foto_mes == 202106]
+cat("   Período:", PARAM$future, "\n")
+cat("   Filas en 202106:", nrow(dfuture), "\n")
+cat("   ESPERADO: 164313\n")
+cat("   DIFERENCIA:", 164313 - nrow(dfuture), "\n\n")
+
+}
+```
+
+#### Training
+Genero el modelo final, siempre sobre TODOS los datos de  final_train, sin hacer ningun tipo de undersampling de la clase mayoritaria y mucho menos cross validation.
+```{r chunk79}
+# # entreno LightGBM
+
+# modelo_final <- lgb.train(
+#   data= dtrain_final,
+#   param= param_normalizado
+# )
+```
+
+```{r chunk80}
+#Entreno ensamble mis semillas
+
+cat("Entrenando", length(PARAM$semillas), "modelos con diferentes semillas...\n")
+
+# Lista para guardar los modelos
+modelos_ensemble <- list()
+
+# Entrenar un modelo por cada semilla
+for(i in 1:length(PARAM$semillas)) {
+
+  cat("\n=== Entrenando modelo", i, "de", length(PARAM$semillas), "con semilla", PARAM$semillas[i], "===\n")
+
+  # Setear la semilla
+  # set.seed(semillas[i])
+  # param_normalizado$seed <- semillas[i]
+
+  set.seed(PARAM$semillas[i])
+  param_normalizado$seed <- PARAM$semillas[i]
+
+  # Entrenar modelo
+  modelo <- lgb.train(
+    data = dtrain_final,
+    param = param_normalizado
+  )
+
+  # Guardar modelo
+  modelos_ensemble[[i]] <- modelo
+
+  cat("Modelo", i, "entrenado exitosamente\n")
+}
+
+cat("\n=== Ensamble de", length(PARAM$semillas), "modelos completado ===\n")
+```
+
+```{r chunk81}
+# grabo a disco el modelo en un formato para seres humanos ... ponele ...
+
+# lgb.save(modelo_final, "modelo.txt" )
+
+
+# Grabo todos los modelos del ensamble
+for(i in 1:length(PARAM$semillas)) {
+  ruta_completa <- file.path(dir_experimento, paste0("modelo_seed_", PARAM$semillas[i], ".txt"))
+  lgb.save(modelos_ensemble[[i]], ruta_completa)
+  cat("Guardado en:", ruta_completa, "\n")
+}
+
+# # para VM
+# for(i in 1:length(PARAM$semillas)) {
+#   lgb.save(modelos_ensemble[[i]], paste0("modelo_seed_", PARAM$semillas[i], ".txt"))
+# }
+# cat("\nTodos los modelos guardados en disco\n")
+
+
+cat("\nTodos los modelos guardados en disco\n")
+```
+
+```{r chunk82}
+# ahora imprimo la importancia de variables
+
+# tb_importancia <- as.data.table(lgb.importance(modelo_final))
+
+tb_importancia <- as.data.table(lgb.importance(modelos_ensemble[[1]]))
+
+ruta_importancia <- file.path(dir_experimento, "impo.txt")
+
+fwrite(tb_importancia,
+  file = ruta_importancia,
+  sep = "\t"
+)
+
+# # para VM
+# fwrite(tb_importancia,
+#   file = "impo.txt",
+#   sep = "\t"
+# )
+
+cat("Importancia guardada en:", ruta_importancia, "\n")
+
+```
+
+```{r chunk83}
+library(ggplot2)
+library(scales)
+
+tb_importancia_top <- head(tb_importancia[order(-Gain)], 20)
+
+p <- ggplot(tb_importancia_top, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "#2C7BB6", alpha = 0.8) +
+  geom_text(aes(label = round(Gain, 0)), hjust = -0.1, size = 3, color = "gray30") +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = paste0("Top 20 Feature Importance - EXP ", PARAM$experimento),
+    subtitle = paste0("Modelo LightGBM - ", length(PARAM$semillas), " semillas"),
+    x = NULL,
+    y = "Gain",
+    caption = paste0("Total features: ", nrow(tb_importancia))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray40"),
+    plot.caption = element_text(size = 9, color = "gray50"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Mostrar gráfico
+print(p)
+
+# para Rstudio
+
+ruta_grafico <- file.path(dir_experimento, 
+                          paste0("feature_importance_ggplot_exp_", PARAM$experimento, ".png"))
+ggsave(ruta_grafico, p, width = 12, height = 8, dpi = 300)
+
+
+# # para VM
+# 
+# ggsave("feature_importance_ggplot_exp_", PARAM$experimento, ".png"), p, width = 12, height = 8, dpi = 300)
+# 
+# cat("\nGráfico guardado como: feature_importance_ggplot_exp_", PARAM$experimento, ".png\n")
+
+
+cat("\nGráfico guardado en:", ruta_grafico, "\n")
+```
+
+```{r chunk84}
+# Gráfico nativo de lightgbm
+
+# 1. Mostrar en pantalla
+lgb.plot.importance(tb_importancia, top_n = 20, measure = "Gain")
+title(main = paste0("Feature Importance - EXP ", PARAM$experimento), line = 0.5)
+
+# 2. Guardar en archivo
+
+# para Rstudio
+ruta_lgb <- file.path(dir_experimento, 
+                      paste0("feature_importance_lgb_exp_", PARAM$experimento, ".png"))
+png(ruta_lgb, width = 800, height = 600)
+lgb.plot.importance(tb_importancia, top_n = 20, measure = "Gain")
+title(main = paste0("Feature Importance - EXP ", PARAM$experimento), line = 0.5)
+dev.off()
+
+# # para VM
+# 
+# png(paste0("feature_importance_lgb_exp_", PARAM$experimento, ".png"), width = 800, height = 600)
+# lgb.plot.importance(tb_importancia, top_n = 20, measure = "Gain")
+# title(main = paste0("Feature Importance - EXP ", PARAM$experimento), line = 0.5)
+# dev.off()
+
+
+cat("\nGráfico guardado en:", ruta_lgb, "\n")
+```
+
+### Scoring
+Aplico el modelo final a los datos del futuro
+```{r chunk85}
+# # aplico el modelo a los datos sin clase
+
+# dfuture <- dataset[foto_mes %in% PARAM$future]
+
+# # aplico el modelo a los datos nuevos
+# prediccion <- predict(
+#   modelo_final,
+#   data.matrix(dfuture[, campos_buenos, with= FALSE])
+# )
+```
+
+```{r chunk86}
+# # aplico el modelo a los datos sin clase
+
+# Definir dfuture
+dfuture <- dataset[foto_mes %in% PARAM$future]
+
+# Aplicar cada modelo y guardar predicciones
+predicciones_ensemble <- list()
+
+cat("\n=== Generando predicciones con el ensamble ===\n")
+
+for(i in 1:length(PARAM$semillas)) {
+# for(i in 1:length(semillas)) {
+  cat("Prediciendo con modelo", i, "\n")
+
+  prediccion_temp <- predict(
+    modelos_ensemble[[i]],
+    data.matrix(dfuture[, campos_buenos, with = FALSE])
+  )
+
+  predicciones_ensemble[[i]] <- prediccion_temp
+}
+
+# Promediar las predicciones
+prediccion <- rowMeans(do.call(cbind, predicciones_ensemble))
+
+cat("Predicción final generada como promedio de",
+length(PARAM$semillas), "modelos\n")
+# length(semillas), "modelos\n")
+
+```
+
+#### Tabla Prediccion
+```{r chunk87}
+tb_prediccion <- dfuture[, list(numero_de_cliente, foto_mes)]
+tb_prediccion[, prob := prediccion]
+
+# para rstudio
+ruta_prediccion <- file.path(dir_experimento, "prediccion.txt")
+
+fwrite(tb_prediccion,
+  file = ruta_prediccion,
+  sep = "\t"
+)
+
+# # para VM
+# fwrite(tb_prediccion,
+#   file = "prediccion.txt",
+#   sep = "\t"
+# )
+
+cat("Predicción guardada en:", ruta_prediccion, "\n")
+```
+
+```{r chunk88}
+# CONTROL FILAS
+# Se deben entregar 164876 predicciones, paquete premium de 202106
+# La primer linea del archivo tiene los títulos, con lo cual 164876 + 1 lineas
+# error dice que debe tener: Submission must have 164313 rows
+
+filas_prediccion <- nrow(tb_prediccion)
+filas202106 <- nrow(dataset[foto_mes == 202106])
+
+print(paste("'tb_prediccion' tiene", filas_prediccion, "filas."))
+print(paste("'202106' tiene", filas202106, "filas."))
+```
+
+```{r chunk89}
+# genero archivos con los  "envios" mejores
+
+# Para Rstudio
+
+# ordeno por probabilidad descendente
+setorder(tb_prediccion, -prob)
+
+
+
+dir_kaggle <- file.path(dir_experimento, "kaggle")
+dir.create(dir_kaggle, showWarnings = FALSE, recursive = TRUE)
+
+for (envios in PARAM$cortes) {
+  tb_prediccion[, Predicted := 0L]
+  tb_prediccion[1:envios, Predicted := 1L]
+  
+  # Usar ruta completa con file.path
+  archivo_kaggle <- file.path(dir_kaggle, paste0("KA", PARAM$experimento, "_", envios, ".csv"))
+  
+  fwrite(tb_prediccion[, list(numero_de_cliente, Predicted)],
+    file = archivo_kaggle,
+    sep = ",",
+    col.names = TRUE
+  )
+  
+  cat("Generado:", basename(archivo_kaggle),
+      " (", format(envios, big.mark = ","), "envíos)\n")
+}
+
+# # para VM
+# 
+# setorder(tb_prediccion, -prob)
+# 
+# dir.create("kaggle", showWarnings = FALSE)
+# 
+# for (envios in PARAM$cortes) {
+#   tb_prediccion[, Predicted := 0L]
+#   tb_prediccion[1:envios, Predicted := 1L]
+#   
+#   archivo_kaggle <- paste0("./kaggle/KA", PARAM$experimento, "_", envios, ".csv")
+#   
+#   fwrite(tb_prediccion[, list(numero_de_cliente, Predicted)],
+#     file = archivo_kaggle,
+#     sep = ",",
+#     col.names = TRUE
+#   )
+#   
+#   cat("Generado:", basename(archivo_kaggle), "\n")
+# }
+
+```
+
+#testeo
+drealidad es el período a predecir con las columnas de interés y fold publico privado.  
+
+Particionar arma este formato  fold = 1  es el 30% del dataset que representaría el "público" de la competencia y fold = 2 es el 70% de ldataset que representaría el "privado" de la competencia? y ambos folds mantienen la representación de los niveles de clase ternaria (continua, baja+1 y baja+2).
+
+ Realidad_inicializar: ejecuta todo esto, arma el kaggle.  
+
+ Realidad evaluar: junta predicciones con realidad en prealidad (cliente, clase ternaria, fold publico o privado y predicción 1 enviar 0 no enviar), calcula ganancias. tbl es tabla resumen de prealidad
+
+
+
+```{r chunk90}
+
+# particionar agrega una columna llamada fold a un dataset
+#   que consiste en una particion estratificada segun agrupa
+# particionar( data=dataset, division=c(70,30),
+#  agrupa=clase_ternaria, seed=semilla)   crea una particion 70, 30
+
+particionar <- function(data, division, agrupa= "", campo= "fold", start= 1, seed= NA) {
+  if (!is.na(seed)) set.seed(seed, "L'Ecuyer-CMRG")
+
+  bloque <- unlist(mapply(
+    function(x, y) {rep(y, x)},division, seq(from= start, length.out= length(division))))
+
+  data[, (campo) := sample(rep(bloque,ceiling(.N / length(bloque))))[1:.N],by= agrupa]
+}
+```
+
+```{r chunk91}
+
+# iniciliazo el dataset de realidad, para medir ganancia
+realidad_inicializar <- function( pfuture, pparam) {
+
+  # datos para verificar la ganancia
+  drealidad <- pfuture[, list(numero_de_cliente, foto_mes, clase_ternaria)]
+
+  particionar(drealidad,
+    division= c(3, 7),
+    agrupa= "clase_ternaria",
+    seed= PARAM$semilla_kaggle
+  )
+
+  return( drealidad )
+}
+```
+
+```{r chunk92}
+
+# evaluo ganancia en los datos de la realidad
+
+realidad_evaluar <- function( prealidad, pprediccion) {
+
+  prealidad[ pprediccion,
+    on= c("numero_de_cliente", "foto_mes"),
+    predicted:= i.Predicted
+  ]
+
+  tbl <- prealidad[, list("qty"=.N), list(fold, predicted, clase_ternaria)]
+
+  res <- list()
+  res$public  <- tbl[fold==1 & predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]/0.3
+  res$private <- tbl[fold==2 & predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]/0.7
+  res$total <- tbl[predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]
+
+  prealidad[, predicted:=NULL]
+  return( res )
+}
+```
+
+
+```{r chunk97}
+
+# Definir dfuture
+false_future <- dataset[foto_mes %in% PARAM$false_future]
+
+# Aplicar cada modelo y guardar predicciones
+predicciones_ensemble_false_future <- list()
+
+cat("\n=== Generando predicciones para testeo ===\n")
+
+for(i in 1:length(PARAM$semillas)) {
+# for(i in 1:length(semillas)) {
+  cat("Prediciendo con modelo para test", i, "\n")
+
+  prediccion_temp_false_future <- predict(
+    modelos_ensemble[[i]],
+    data.matrix(false_future[, campos_buenos, with = FALSE])
+  )
+
+  predicciones_ensemble_false_future[[i]] <- prediccion_temp_false_future
+}
+
+# Promediar las predicciones
+prediccion_false_future <- rowMeans(do.call(cbind, predicciones_ensemble_false_future))
+
+cat("Predicción final false_future generada como promedio de",
+length(PARAM$semillas), "modelos \n")
+# length(semillas), "modelos\n")
+
+```
+
+```{r chunk98}
+
+tb_prediccion_false_future <- false_future[, list(numero_de_cliente, foto_mes)]
+tb_prediccion_false_future[, prob := prediccion_false_future]
+
+# para Rstudio
+ruta_prediccion_ff <- file.path(dir_experimento, "prediccion_false_future.txt")
+
+fwrite(tb_prediccion_false_future,
+  file = ruta_prediccion_ff,
+  sep = "\t"
+)
+
+# # para VM
+# fwrite(tb_prediccion_false_future,
+#   file = "prediccion_false_future.txt",
+#   sep = "\t"
+# )
+
+cat("Predicción false_future guardada en:", ruta_prediccion_ff, "\n")
+
+```
+
+```{r chunk99}
+
+# inicilizo el dataset  drealidad SOLO PARA BACKTESTING
+
+drealidad <- realidad_inicializar( false_future, PARAM)
+```
+
+
+```{r chunk100}
+
+PARAM$cortes
+```
+
+```{r chunk101}
+
+# genero los  "envios" mejores de false future
+
+# ordeno por probabilidad descendente
+setorder(tb_prediccion_false_future, -prob)
+
+for (envios in PARAM$cortes) {
+
+  tb_prediccion_false_future[, Predicted := 0L] # seteo inicial a 0
+  tb_prediccion_false_future[1:envios, Predicted := 1L] # marco los primeros
+
+   res <- realidad_evaluar( drealidad, tb_prediccion_false_future)
+
+  options(scipen = 999)
+  cat( "Envios=", envios, "\t",
+    " TOTAL=", res$total,
+    "  Public=", res$public,
+    " Private=", res$private,
+    "\n",
+    sep= ""
+  )
+
+}
+
+
+```
+
+```{r chunk102}
+
+# Guardar resultados de ganancia por cada corte (solo para graficar)
+resultados_ganancia <- data.table()
+
+setorder(tb_prediccion_false_future, -prob)
+
+for (envios in PARAM$cortes) {
+  tb_prediccion_false_future[, Predicted := 0L]
+  tb_prediccion_false_future[1:envios, Predicted := 1L]
+  
+  res <- realidad_evaluar(drealidad, tb_prediccion_false_future)
+  
+  options(scipen = 999)
+  cat("Envios=", envios, "\t",
+    " TOTAL=", res$total,
+    "  Public=", res$public,
+    " Private=", res$private,
+    "\n",
+    sep = ""
+  )
+  
+  resultados_ganancia <- rbind(resultados_ganancia,
+    data.table(envios = envios, ganancia_total = res$total))
+}
+
+p <- ggplot(resultados_ganancia, aes(x = envios, y = ganancia_total)) +
+  geom_line(color = "#2C7BB6", size = 1) +
+  geom_point(color = "#2C7BB6", size = 2) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray50", alpha = 0.3) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = paste0("Curva de Ganancia - EXP ", PARAM$experimento),
+    x = "Cantidad de Envios",
+    y = "Ganancia Total ($)"
+  ) +
+  theme_minimal()
+
+print(p)
+
+# para Rstudio
+ruta_curva <- file.path(dir_experimento, 
+                        paste0("curva_ganancia_exp_", PARAM$experimento, ".png"))
+ggsave(ruta_curva, p, width = 10, height = 6, dpi = 300)
+
+# # para VM
+# ggsave("curva_ganancia_exp_", PARAM$experimento, ".png"), p, width = 10, height = 6, dpi = 300)
+# cat("\nGráfico guardado\n")
+
+
+cat("\nGráfico guardado en:", ruta_curva, "\n")
+```
+
+# un ejercidio aparte
+```{r chunk103}
+
+# solo un ejercicio
+# Explora las probabilidades predichas para encontrar "codos" naturales
+
+
+# Después de predecir en 202106
+tb_prediccion[, prob := prediccion]
+setorder(tb_prediccion, -prob)
+
+# Agrega ranking
+tb_prediccion[, rank := 1:.N]
+
+# Visualiza distribución
+plot(tb_prediccion$rank, tb_prediccion$prob, type="l",
+     xlab="Ranking", ylab="Probabilidad",
+     main="Distribución de Probabilidades Predichas")
+
+# Busca el "codo" donde la probabilidad cae abruptamente
+abline(h=0.05, col="red", lty=2)  # Umbral ejemplo
+
+# Estadísticas por percentiles
+cuantiles <- quantile(tb_prediccion$prob, probs=seq(0, 1, 0.1))
+print(cuantiles)
+
+# Cuántos clientes con prob > umbral
+umbral <- 0.05
+n_sobre_umbral <- tb_prediccion[prob > umbral, .N]
+cat("Clientes con prob >", umbral, ":", n_sobre_umbral, "\n")
+```
+
+```{r chunk104}
+
+#para Rstudio
+
+ruta_param <- file.path(dir_experimento, "PARAM.yml")
+write_yaml(PARAM, file = ruta_param)
+cat("PARAM guardado en:", ruta_param, "\n")
+
+# # para VM
+# write_yaml(PARAM, file = "PARAM.yml")
+
+```
+
+```{r chunk105}
+
+# CONTROL FILAS
+# : Submission must have 164313 rows
+
+filas_prediccion_ff <- nrow(tb_prediccion_false_future)
+filas202106 <- nrow(dataset[foto_mes == 202106])
+
+print(paste("'tb_prediccion_ff' tiene", filas_prediccion_ff, "filas."))
+print(paste("'202106' tiene", filas202106, "filas."))
+```
+
+```{r chunk106}
+format(Sys.time(), "%a %b %d %X %Y")
+```
+
+```{r}
+# Crear ranking percentil -1 a 1 para mcaja_ahorro
+
+dataset[, mcaja_ahorro_rank := {
+  
+  # Separar positivos y negativos
+  positivos <- .SD[mcaja_ahorro > 0, mcaja_ahorro]
+  negativos <- .SD[mcaja_ahorro < 0, mcaja_ahorro]
+  ceros <- .SD[mcaja_ahorro == 0, mcaja_ahorro]
+  
+  # Calcular percentiles
+  rank_pos <- frank(positivos, ties.method = "average") / length(positivos)
+  rank_neg <- -frank(-negativos, ties.method = "average") / length(negativos)
+  rank_cero <- rep(0, length(ceros))
+  
+  # Asignar según el valor original
+  resultado <- numeric(.N)
+  resultado[mcaja_ahorro > 0] <- rank_pos
+  resultado[mcaja_ahorro < 0] <- rank_neg
+  resultado[mcaja_ahorro == 0] <- rank_cero
+  
+  resultado
+}]
+
+# Verificar
+cat("Rango del ranking:", range(dataset$mcaja_ahorro_rank, na.rm = TRUE), "\n")
+cat("Cantidad de 0s:", sum(dataset$mcaja_ahorro_rank == 0, na.rm = TRUE), "\n")
+cat("Cantidad de positivos:", sum(dataset$mcaja_ahorro_rank > 0, na.rm = TRUE), "\n")
+cat("Cantidad de negativos:", sum(dataset$mcaja_ahorro_rank < 0, na.rm = TRUE), "\n")
+
+# Visualizar distribución
+hist(dataset$mcaja_ahorro_rank, breaks = 50, main = "Distribución ranking mcaja_ahorro")
+```
+
