@@ -1,0 +1,159 @@
+experimento: 4940
+semilla_primigenia: &id001
+- 878787
+train:
+- 202101
+- 202102
+- 202103
+train_final:
+- 202101
+- 202102
+- 202103
+- 202104
+future:
+- 202106
+semilla_kaggle: 314159
+cortes:
+- 6000
+- 6500
+- 7000
+- 7500
+- 8000
+- 8500
+- 9000
+- 9500
+- 10000
+- 10500
+- 11000
+- 11500
+- 12000
+- 12500
+- 13000
+- 13500
+- 14000
+- 14500
+- 15000
+- 15500
+- 16000
+- 16500
+- 17000
+- 17500
+- 18000
+- 18500
+- 19000
+trainingstrategy:
+  undersampling: 0.2
+hyperparametertuning:
+  xval_folds: 5
+  hs:
+    num_iterations:
+      type: int
+      low: 10
+      high: 1500
+    learning_rate:
+      type: float
+      low: 0.01
+      high: 0.3
+    feature_fraction:
+      type: float
+      low: 0.4
+      high: 1.0
+    num_leaves:
+      type: int
+      low: 500
+      high: 2800
+    min_data_in_leaf:
+      type: int
+      low: 1
+      high: 1500
+    max_depth:
+      type: int
+      low: 0
+      high: 22
+    lambda_l1:
+      type: float
+      low: 0.0
+      high: 15.0
+    lambda_l2:
+      type: float
+      low: 0.0
+      high: 15.0
+    min_gain_to_split:
+      type: float
+      low: 0.0
+      high: 10.0
+    bagging_fraction:
+      type: float
+      low: 0.4
+      high: 1.0
+    bagging_freq:
+      type: int
+      low: 1
+      high: 15
+    min_sum_hessian_in_leaf:
+      type: float
+      low: 0.001
+      high: 20.0
+    boosting_type:
+      type: categorical
+      choices:
+      - gbdt
+      - dart
+    scale_pos_weight:
+      type: float
+      low: 1.0
+      high: 50.0
+    max_bin:
+      type: int
+      low: 25
+      high: 100
+lgbm:
+  param_fijos:
+    boosting_type: gbdt
+    objective: binary
+    metric: auc
+    first_metric_only: false
+    boost_from_average: true
+    feature_pre_filter: false
+    force_row_wise: true
+    verbosity: -100
+    seed: *id001
+    max_depth: -1
+    min_gain_to_split: 0.0
+    min_sum_hessian_in_leaf: 0.001
+    lambda_l1: 0.0
+    lambda_l2: 0.0
+    max_bin: 31
+    bagging_fraction: 1.0
+    pos_bagging_fraction: 1.0
+    neg_bagging_fraction: 1.0
+    is_unbalance: false
+    scale_pos_weight: 1.0
+    drop_rate: 0.1
+    max_drop: 50
+    skip_drop: 0.5
+    extra_trees: false
+    num_iterations: 1200
+    learning_rate: 0.02
+    feature_fraction: 0.5
+    num_leaves: 750
+    min_data_in_leaf: 5000
+out:
+  lgbm:
+    mejores_hiperparametros:
+      boosting_type: dart
+      num_iterations: 650
+      learning_rate: 0.09447556289364047
+      num_leaves: 2451
+      feature_fraction: 0.8323251056180896
+      max_depth: 15
+      min_data_in_leaf: 112
+      lambda_l1: 3.3661673895549624
+      lambda_l2: 0.024603888050272582
+      min_gain_to_split: 0.9548524257248387
+      bagging_fraction: 0.9422508753653047
+      bagging_freq: 5
+      min_sum_hessian_in_leaf: 4.9762082919650705
+      scale_pos_weight: 6.124837396332106
+      max_bin: 60
+    y: 0.9405421052864336
