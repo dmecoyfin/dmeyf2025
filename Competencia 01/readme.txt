@@ -1,1 +1,2 @@
-
+Primero debe ejecutarse la notebook "Primer Notebook - Score 7k Public". De dicha notebook se obtiene un archivo feature_importance_primer_notebook.txt el cual se utilizará en la notebook "Segunda notebook - Score 9k Public" que es idéntica a la primera con la diferencia de que esta última descarta las features con importancia menor a 100 de lo obtenido en la primera notebook, además del agregado de hiperparámetros y ajuste en los rangos de otros. 
+Se tomó el .csv de 11000 envíos para subir a Kaggle.
